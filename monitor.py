@@ -53,48 +53,46 @@ def get_user_targets():
         print(f"⚠️ 讀取線上控制台失敗: {e}")
     return targets
 
-def get_official_thresholds():
-    """全相容剖析水利署 OpenData 警戒門檻 API"""
-    thresholds = {}
+def parse_val(v):
+    if v is None: return None
+    s = str(v).strip()
+    if not s or s == "null" or s == "-999": return None
     try:
-        res = requests.get(WARNING_LEVELS_URL, timeout=15, verify=False)
+        return float(s)
+    except ValueError:
+        return None
+
+def get_official_thresholds(token):
+    """取得警戒門檻（帶入水利署認證 Header）"""
+    thresholds = {}
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "Mozilla/5.0"
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    try:
+        res = requests.get(WARNING_LEVELS_URL, headers=headers, timeout=15, verify=False)
         if res.status_code == 200:
             data = res.json()
-            
-            # 自動適應 JSON 根節點或層級嵌套
-            records = []
-            if isinstance(data, list):
-                records = data
-            elif isinstance(data, dict):
-                records = data.get("responseData") or data.get("data") or data.get("records") or []
-
-            def parse_val(v):
-                if v is None: return None
-                s = str(v).strip()
-                if not s or s == "null" or s == "-999": return None
-                try:
-                    return float(s)
-                except ValueError:
-                    return None
-
+            records = data if isinstance(data, list) else data.get("responseData", data.get("data", []))
             for item in records:
                 if not isinstance(item, dict): continue
-                
-                # 自動搜尋可能的測站名稱欄位
-                name = item.get("StationName") or item.get("propertyName") or item.get("stationName") or item.get("Name")
+                name = item.get("StationName") or item.get("propertyName") or item.get("stationName")
                 if not name: continue
                 name = str(name).strip()
 
-                # 自動搜尋一/二/三級門檻欄位名稱
-                l1 = parse_val(item.get("WarningLevel1") or item.get("Level1") or item.get("warningLevel1"))
-                l2 = parse_val(item.get("WarningLevel2") or item.get("Level2") or item.get("warningLevel2"))
-                l3 = parse_val(item.get("WarningLevel3") or item.get("Level3") or item.get("warningLevel3"))
+                l1 = parse_val(item.get("WarningLevel1") or item.get("Level1"))
+                l2 = parse_val(item.get("WarningLevel2") or item.get("Level2"))
+                l3 = parse_val(item.get("WarningLevel3") or item.get("Level3"))
 
                 thresholds[name] = {"l1": l1, "l2": l2, "l3": l3}
-            
             print(f"🌐 成功解析官方 {len(thresholds)} 個測站警戒門檻資料。")
+        else:
+            print(f"⚠️ 門檻 API 回傳狀態碼 HTTP {res.status_code}，切換為試算表自訂門檻模式。")
     except Exception as e:
-        print(f"⚠️ 讀取官方警戒門檻 API 失敗: {e}")
+        print(f"⚠️ 讀取官方警戒門檻 API 異常: {e}")
     return thresholds
 
 def send_telegram_alert(message):
@@ -149,7 +147,8 @@ def main():
         print("ℹ️ 目前沒有開啟任何監控目標。")
         return
 
-    official_thresholds = get_official_thresholds()
+    # 帶入 Token 以防 API 擋連線
+    official_thresholds = get_official_thresholds(token)
     realtime_map = {str(item.get("Name", "")).strip(): item for item in stations_data}
 
     for st_name, custom_cfg in target_config.items():
@@ -170,6 +169,7 @@ def main():
         if water_level is None:
             continue
 
+        # 優先取用試算表自訂門檻，若無自訂則取用官方門檻
         off_cfg = official_thresholds.get(st_name, {})
         l1 = custom_cfg.get("l1") or off_cfg.get("l1")
         l2 = custom_cfg.get("l2") or off_cfg.get("l2")
