@@ -16,46 +16,34 @@ GOOGLE_WEBAPP_URL = os.environ.get("GOOGLE_WEBAPP_URL", "").strip()
 
 IOT_TOKEN_URL = "https://iot.wra.gov.tw/Oauth2/token"
 IOT_STATIONS_URL = "https://iot.wra.gov.tw/river/stations"
-# 正規的水利署 OpenData 警戒水位門檻 API
 WARNING_LEVELS_URL = "https://opendata.wra.gov.tw/api/v2/39ad439a-f7aa-4fd4-b1a7-e4622852cc69?sort=_importdate%20asc&format=JSON"
 
-def get_wra_token():
-    """使用 Client ID / Secret 取得水利署 IoT 認證 Token"""
-    try:
-        payload = {
-            "grant_type": "client_credentials",
-            "client_id": CLIENT_ID,
-            "client_secret": CLIENT_SECRET
-        }
-        res = requests.post(IOT_TOKEN_URL, data=payload, timeout=15, verify=False)
-        if res.status_code == 200:
-            return res.json().get("access_token")
-        else:
-            print(f"❌ IoT Oauth2 認證失敗，HTTP 狀態碼：{res.status_code}")
-    except Exception as e:
-        print(f"❌ 取得 IoT Token 異常: {e}")
-    return None
+# 建立預設 Header，模擬台灣 Chrome 瀏覽器請求[cite: 1, 2]
+HTTP_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://opendata.wra.gov.tw/"
+}
 
 def sync_stations_to_sheet(stations_data):
-    """將 API 測站資訊寫入 Google Sheet 字典"""
     if not GOOGLE_WEBAPP_URL:
         return
     dict_list = [[str(st.get("Name", "")).strip(), str(st.get("BasinName", "未知")).strip()] for st in stations_data if st.get("Name")]
     try:
-        res = requests.post(GOOGLE_WEBAPP_URL, json=dict_list, timeout=15)
+        res = requests.post(GOOGLE_WEBAPP_URL, json=dict_list, headers=HTTP_HEADERS, timeout=15)
         if res.status_code == 200:
             print(f"🔄 已成功同步 {len(dict_list)} 個測站至試算表字典。")
     except Exception as e:
         print(f"⚠️ 同步測站字典失敗: {e}")
 
 def get_user_targets():
-    """讀取 Google Sheet 控制台設定"""
     targets = {}
     if not GOOGLE_SHEET_ID:
         return targets
     url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&sheet=控制台"
     try:
-        res = requests.get(url, timeout=10)
+        res = requests.get(url, headers=HTTP_HEADERS, timeout=10)
         if res.status_code == 200:
             res.encoding = 'utf-8'
             csv_reader = csv.reader(io.StringIO(res.text))
@@ -73,47 +61,50 @@ def get_user_targets():
         print(f"⚠️ 讀取線上控制台失敗: {e}")
     return targets
 
-def fetch_official_thresholds_from_iot(stations_data):
-    """
-    從 IoT API 回傳的測站詳細屬性中，直接解析官方定義的水位警戒門檻
-    """
-    thresholds = {}
-    for st in stations_data:
-        name = str(st.get("Name", "")).strip()
-        if not name:
-            continue
-        
-        l1, l2, l3 = None, None, None
-        
-        # 解析 IoT 測站屬性欄位 (Thresholds / AlarmLevels)
-        for attr in st.get("Attributes", []):
-            attr_name = str(attr.get("Name", "")).lower()
-            val = attr.get("Value")
-            try:
-                num_val = float(val) if val is not None else None
-                if "level1" in attr_name or "一級" in attr_name:
-                    l1 = num_val
-                elif "level2" in attr_name or "二級" in attr_name:
-                    l2 = num_val
-                elif "level3" in attr_name or "三級" in attr_name:
-                    l3 = num_val
-            except ValueError:
-                pass
+def parse_val(v):
+    if v is None: return None
+    s = str(v).strip()
+    if not s or s == "null" or s == "-999": return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
 
-        if l1 or l2 or l3:
-            thresholds[name] = {"l1": l1, "l2": l2, "l3": l3}
+def get_official_thresholds():
+    """試圖從水利署 OpenData API 獲取官方門檻"""
+    thresholds = {}
+    try:
+        res = requests.get(WARNING_LEVELS_URL, headers=HTTP_HEADERS, timeout=15, verify=False)
+        if res.status_code == 200:
+            data = res.json()
+            records = data if isinstance(data, list) else data.get("responseData", data.get("data", []))
             
+            for item in records:
+                if not isinstance(item, dict): continue
+                name = item.get("StationName") or item.get("propertyName") or item.get("stationName")
+                if not name: continue
+                name = str(name).strip()
+
+                l1 = parse_val(item.get("WarningLevel1") or item.get("Level1"))
+                l2 = parse_val(item.get("WarningLevel2") or item.get("Level2"))
+                l3 = parse_val(item.get("WarningLevel3") or item.get("Level3"))
+
+                thresholds[name] = {"l1": l1, "l2": l2, "l3": l3}
+            print(f"🌐 成功解析官方 {len(thresholds)} 個測站警戒門檻資料。")
+        else:
+            print(f"⚠️ 門檻 API 回傳 HTTP 狀態碼：{res.status_code}")
+    except Exception as e:
+        print(f"⚠️ 讀取官方警戒門檻 API 異常: {e}")
     return thresholds
 
 def send_telegram_alert(message):
-    """發送 Telegram 推播"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ 未設定 Telegram 金鑰，跳過推播。")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        res = requests.post(url, json=payload, timeout=10)
+        res = requests.post(url, json=payload, headers=HTTP_HEADERS, timeout=10)
         if res.status_code == 200:
             print("🚨 警報已成功發送至 Telegram！")
         else:
@@ -121,20 +112,29 @@ def send_telegram_alert(message):
     except Exception as e:
         print(f"❌ 發送 Telegram 訊息異常: {e}")
 
+def get_wra_token():
+    try:
+        payload = {"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET}
+        res = requests.post(IOT_TOKEN_URL, data=payload, headers=HTTP_HEADERS, timeout=15, verify=False)
+        if res.status_code == 200:
+            return res.json().get("access_token")
+    except Exception:
+        pass
+    return None
+
 def main():
     print("🚀 開始執行河川水位巡檢與警報核對...")
     
-    # 1. 驗證身分並取得 Token
     token = get_wra_token()
     if not token:
-        print("❌ 無法取得水利署 API Token，停止執行。")
+        print("❌ 無法取得水利署 API Token")
         return
-    print("✅ 成功透過 CLIENT_ID / CLIENT_SECRET 取得水利署 API 授權。")
 
-    # 2. 從水利署 IoT 平台抓取完整的測站與屬性資料
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    req_headers = HTTP_HEADERS.copy()
+    req_headers["Authorization"] = f"Bearer {token}"
+
     try:
-        res = requests.get(IOT_STATIONS_URL, headers=headers, timeout=20, verify=False)
+        res = requests.get(IOT_STATIONS_URL, headers=req_headers, timeout=20, verify=False)
         stations_data = res.json() if res.status_code == 200 else []
     except Exception as e:
         print(f"❌ 擷取 API 水位資料失敗: {e}")
@@ -144,22 +144,16 @@ def main():
         print("ℹ️ 未取得任何即時測站資料。")
         return
 
-    # 3. 同步字典至 Google Sheet
     sync_stations_to_sheet(stations_data)
 
-    # 4. 讀取使用者設定
     target_config = get_user_targets()
     if not target_config:
         print("ℹ️ 目前沒有開啟任何監控目標。")
         return
 
-    # 5. 直接從授權的 IoT API 抽取官方門檻
-    official_thresholds = fetch_official_thresholds_from_iot(stations_data)
-    print(f"🌐 成功從 IoT 授權 API 提取 {len(official_thresholds)} 個測站的官方警戒門檻。")
-
+    official_thresholds = get_official_thresholds()
     realtime_map = {str(item.get("Name", "")).strip(): item for item in stations_data}
 
-    # 6. 比對水位與發送警報
     for st_name, custom_cfg in target_config.items():
         st_data = realtime_map.get(st_name)
         if not st_data:
@@ -178,7 +172,6 @@ def main():
         if water_level is None:
             continue
 
-        # 優先採用 Google Sheet 自訂門檻，若無自訂則採用 IoT API 提供的官方門檻
         off_cfg = official_thresholds.get(st_name, {})
         l1 = custom_cfg.get("l1") if custom_cfg.get("l1") is not None else off_cfg.get("l1")
         l2 = custom_cfg.get("l2") if custom_cfg.get("l2") is not None else off_cfg.get("l2")
