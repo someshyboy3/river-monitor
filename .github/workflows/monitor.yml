@@ -3,23 +3,23 @@ name: River Water Level Monitor
 on:
   schedule:
     - cron: '*/15 * * * *'  # 每 15 分鐘自動執行一次
-  workflow_dispatch:       # 允許手動點擊執行
+  workflow_dispatch:        # 支援手動點擊執行
 
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
-
     steps:
-      - name: 取得專案檔案
+      - name: 檢出程式碼
         uses: actions/checkout@v4
 
-      - name: 安裝 Python
+      - name: 設定 Python 環境
         uses: actions/setup-python@v5
         with:
           python-version: '3.10'
 
-      - name: 安裝套件
+      - name: 安裝依賴套件
         run: |
+          python -m pip install --upgrade pip
           pip install requests urllib3
 
       - name: 執行監控程式
@@ -28,5 +28,6 @@ jobs:
           CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python monitor.py
+          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
+          GOOGLE_WEBAPP_URL: ${{ secrets.GOOGLE_WEBAPP_URL }}
+        run: python monitor.py
