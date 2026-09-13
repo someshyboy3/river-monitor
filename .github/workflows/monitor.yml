@@ -2,9 +2,9 @@ name: 24hr River Level Monitor
 
 on:
   schedule:
-    # Cron 語法：每 15 分鐘自動執行一次 (可依需求調整)
-    - cron: '*/15 * * * *'
-  workflow_dispatch: # 允許在 GitHub 網頁上手動點擊觸發
+    # 每 5 分鐘自動巡檢一次
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
 
 jobs:
   run-monitor:
@@ -16,7 +16,7 @@ jobs:
       - name: 設定 Python 環境
         uses: actions/setup-python@v4
         with:
-          python-python: '3.10'
+          python-version: '3.10'
 
       - name: 安裝套件
         run: |
@@ -32,3 +32,11 @@ jobs:
           GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
           GOOGLE_WEBAPP_URL: ${{ secrets.GOOGLE_WEBAPP_URL }}
         run: python monitor.py
+
+      - name: 更新警報快取記錄 (Push alert_cache.json)
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add alert_cache.json
+          git diff-index --quiet HEAD || git commit -m "chore: update alert cache"
+          git push
