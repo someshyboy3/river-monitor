@@ -9,6 +9,9 @@ on:
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write # 明確授予 GitHub Action 修改與提交檔案的權限
+
     steps:
       - name: 檢出專案程式碼
         uses: actions/checkout@v3
