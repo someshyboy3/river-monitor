@@ -5,8 +5,10 @@ import json
 import requests
 import urllib3
 
+# 關閉不安全 HTTP 請求的警告訊息
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
+# 從環境變數讀取金鑰與設定
 CLIENT_ID = os.environ.get("CLIENT_ID", "").strip()
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -17,26 +19,24 @@ GOOGLE_WEBAPP_URL = os.environ.get("GOOGLE_WEBAPP_URL", "").strip()
 IOT_TOKEN_URL = "https://iot.wra.gov.tw/Oauth2/token"
 IOT_STATIONS_URL = "https://iot.wra.gov.tw/river/stations"
 
-# 可替換為你的 Cloudflare Worker 中轉網址，避開海外 IP 封鎖
-WARNING_LEVELS_URL = "https://opendata.wra.gov.tw/api/v2/39ad439a-f7aa-4fd4-b1a7-e4622852cc69?sort=_importdate%20asc&format=JSON"
-
 HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+    "Accept": "application/json"
 }
 
 def sync_stations_to_sheet(stations_data):
+    """將 API 抓到的測站字典同步至 Google 試算表"""
     if not GOOGLE_WEBAPP_URL:
         return
     dict_list = [[str(st.get("Name", "")).strip(), str(st.get("BasinName", "未知")).strip()] for st in stations_data if st.get("Name")]
     try:
-        res = requests.post(GOOGLE_WEBAPP_URL, json=dict_list, headers=HTTP_HEADERS, timeout=15)
-        if res.status_code == 200:
-            print(f"🔄 已成功同步 {len(dict_list)} 個測站至試算表字典。")
+        requests.post(GOOGLE_WEBAPP_URL, json=dict_list, headers=HTTP_HEADERS, timeout=15)
+        print(f"🔄 已成功同步 {len(dict_list)} 個測站至試算表字典。")
     except Exception as e:
         print(f"⚠️ 同步測站字典失敗: {e}")
 
 def get_user_targets():
+    """從 Google 試算表『控制台』分頁讀取使用者自訂設定"""
     targets = {}
     if not GOOGLE_SHEET_ID:
         return targets
@@ -46,7 +46,7 @@ def get_user_targets():
         if res.status_code == 200:
             res.encoding = 'utf-8'
             csv_reader = csv.reader(io.StringIO(res.text))
-            next(csv_reader, None)
+            next(csv_reader, None)  # 略過標頭列
             for row in csv_reader:
                 if len(row) >= 3:
                     st_name = row[1].strip()
@@ -60,56 +60,61 @@ def get_user_targets():
         print(f"⚠️ 讀取線上控制台失敗: {e}")
     return targets
 
-def parse_val(v):
-    if v is None: return None
-    s = str(v).strip()
-    if not s or s == "null" or s == "-999": return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-def get_official_thresholds():
+def get_sheet_official_thresholds():
+    """直接從 Google 試算表『官方警戒線』分頁讀取門檻資料"""
     thresholds = {}
+    if not GOOGLE_SHEET_ID:
+        print("⚠️ 未設定 GOOGLE_SHEET_ID，無法讀取官方警戒線。")
+        return thresholds
+
+    url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&sheet=官方警戒線"
     try:
-        res = requests.get(WARNING_LEVELS_URL, headers=HTTP_HEADERS, timeout=15, verify=False)
+        res = requests.get(url, headers=HTTP_HEADERS, timeout=10)
         if res.status_code == 200:
-            data = res.json()
-            records = data if isinstance(data, list) else data.get("responseData", data.get("data", []))
-            for item in records:
-                if not isinstance(item, dict): continue
-                name = item.get("StationName") or item.get("propertyName") or item.get("stationName")
-                if not name: continue
-                name = str(name).strip()
+            res.encoding = 'utf-8'
+            csv_reader = csv.reader(io.StringIO(res.text))
+            next(csv_reader, None)  # 略過第一列標頭
+            
+            for row in csv_reader:
+                if len(row) >= 4:
+                    st_name = row[0].strip()
+                    if not st_name:
+                        continue
+                    
+                    def parse_float(val):
+                        try:
+                            return float(val.strip()) if val and val.strip() else None
+                        except ValueError:
+                            return None
 
-                l1 = parse_val(item.get("WarningLevel1") or item.get("Level1"))
-                l2 = parse_val(item.get("WarningLevel2") or item.get("Level2"))
-                l3 = parse_val(item.get("WarningLevel3") or item.get("Level3"))
-
-                thresholds[name] = {"l1": l1, "l2": l2, "l3": l3}
-            print(f"🌐 成功解析官方 {len(thresholds)} 個測站警戒門檻資料。")
+                    # 欄位對應：StationName, WarningLevel3, WarningLevel2, WarningLevel1
+                    l3 = parse_float(row[1])
+                    l2 = parse_float(row[2])
+                    l1 = parse_float(row[3])
+                    
+                    thresholds[st_name] = {"l1": l1, "l2": l2, "l3": l3}
+                    
+            print(f"🌐 成功從試算表讀取 {len(thresholds)} 個官方警戒線資料。")
         else:
-            print(f"⚠️ 門檻 API 回傳 HTTP 狀態碼：{res.status_code}")
+            print(f"⚠️ 讀取『官方警戒線』分頁失敗，HTTP 狀態碼: {res.status_code}")
     except Exception as e:
-        print(f"⚠️ 讀取官方警戒門檻 API 異常: {e}")
+        print(f"⚠️ 讀取試算表官方警戒線異常: {e}")
     return thresholds
 
 def send_telegram_alert(message):
+    """發送警報至 Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("⚠️ 未設定 Telegram 金鑰，跳過推播。")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
     try:
-        res = requests.post(url, json=payload, headers=HTTP_HEADERS, timeout=10)
-        if res.status_code == 200:
-            print("🚨 警報已成功發送至 Telegram！")
-        else:
-            print(f"❌ Telegram 推播失敗: HTTP {res.status_code} - {res.text}")
+        requests.post(url, json=payload, headers=HTTP_HEADERS, timeout=10)
+        print("🚨 警報已成功發送至 Telegram！")
     except Exception as e:
         print(f"❌ 發送 Telegram 訊息異常: {e}")
 
 def get_wra_token():
+    """取得水利署 API OAuth2 Bearer Token"""
     try:
         payload = {"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET}
         res = requests.post(IOT_TOKEN_URL, data=payload, headers=HTTP_HEADERS, timeout=15, verify=False)
@@ -141,16 +146,20 @@ def main():
         print("ℹ️ 未取得任何即時測站資料。")
         return
 
+    # 1. 同步全台 1600+ 測站資料庫至試算表字典
     sync_stations_to_sheet(stations_data)
 
+    # 2. 讀取使用者要在控制台監控的測站清單
     target_config = get_user_targets()
     if not target_config:
-        print("ℹ️ 目前沒有開啟任何監控目標。")
+        print("ℹ️ 目前控制台沒有開啟任何 YES 監控目標。")
         return
 
-    official_thresholds = get_official_thresholds()
+    # 3. 讀取試算表中由 GAS 抓好的『官方警戒線』門檻
+    official_thresholds = get_sheet_official_thresholds()
     realtime_map = {str(item.get("Name", "")).strip(): item for item in stations_data}
 
+    # 4. 逐一比對水位與發送通知
     for st_name, custom_cfg in target_config.items():
         st_data = realtime_map.get(st_name)
         if not st_data:
@@ -169,20 +178,21 @@ def main():
         if water_level is None:
             continue
 
+        # 優先權：控制台自訂數值 > 官方警戒線分頁數值
         off_cfg = official_thresholds.get(st_name, {})
         l1 = custom_cfg.get("l1") if custom_cfg.get("l1") is not None else off_cfg.get("l1")
         l2 = custom_cfg.get("l2") if custom_cfg.get("l2") is not None else off_cfg.get("l2")
         l3 = custom_cfg.get("l3") if custom_cfg.get("l3") is not None else off_cfg.get("l3")
 
         alert_level = None
-        if l1 and water_level >= l1:
+        if l1 is not None and water_level >= l1:
             alert_level = "🔴 一級警戒 (極高危險)"
-        elif l2 and water_level >= l2:
+        elif l2 is not None and water_level >= l2:
             alert_level = "🟠 二級警戒 (高危險)"
-        elif l3 and water_level >= l3:
+        elif l3 is not None and water_level >= l3:
             alert_level = "🟡 三級警戒 (注意)"
 
-        print(f"📊 [{st_name}] 水位：{water_level:.3f} m | 門檻 (三/二/一級): {l3}/{l2}/{l1} | 狀態: {alert_level or '🟢 正常'}")
+        print(f"📊 [{st_name}] 水位：{water_level:.3f} m | 警戒線 (三/二/一級): {l3}/{l2}/{l1} | 狀態: {alert_level or '🟢 正常'}")
 
         if alert_level:
             msg = (
