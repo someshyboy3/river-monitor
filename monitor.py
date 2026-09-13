@@ -9,11 +9,11 @@ import urllib3
 # 關閉不安全 HTTP 請求警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# 環境變數與金鑰
+# 從環境變數讀取金鑰與基本設定
 CLIENT_ID = os.environ.get("CLIENT_ID", "").strip()
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip()  # 備用 Chat ID
 GOOGLE_SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", "").strip()
 GOOGLE_WEBAPP_URL = os.environ.get("GOOGLE_WEBAPP_URL", "").strip()
 
@@ -40,7 +40,7 @@ def load_alert_cache():
     return {}
 
 def save_alert_cache(cache_data):
-    """儲存警報快取記錄"""
+    """儲存警報快取記錄至 alert_cache.json"""
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(cache_data, f, ensure_ascii=False, indent=2)
@@ -48,7 +48,7 @@ def save_alert_cache(cache_data):
         print(f"⚠️ 寫入警報快取失敗: {e}")
 
 def sync_stations_to_sheet(stations_data):
-    """將 API 抓到的測站字典同步至 Google 試算表"""
+    """將 API 抓到的全台測站字典同步至 Google 試算表"""
     if not GOOGLE_WEBAPP_URL:
         return
     dict_list = [[str(st.get("Name", "")).strip(), str(st.get("BasinName", "未知")).strip()] for st in stations_data if st.get("Name")]
@@ -59,7 +59,7 @@ def sync_stations_to_sheet(stations_data):
         print(f"⚠️ 同步測站字典失敗: {e}")
 
 def get_user_targets():
-    """從 Google 試算表『控制台』分頁讀取使用者自訂設定"""
+    """從 Google 試算表『控制台』分頁讀取使用者自訂監控目標與門檻 (B, C, D, E, F 欄)"""
     targets = {}
     if not GOOGLE_SHEET_ID:
         return targets
@@ -69,19 +69,52 @@ def get_user_targets():
         if res.status_code == 200:
             res.encoding = 'utf-8'
             csv_reader = csv.reader(io.StringIO(res.text))
-            next(csv_reader, None)  # 略過標頭
+            next(csv_reader, None)  # 略過標頭列
             for row in csv_reader:
                 if len(row) >= 3:
-                    st_name = row[1].strip()
-                    is_active = row[2].strip().upper()
+                    st_name = row[1].strip()  # B 欄
+                    is_active = row[2].strip().upper()  # C 欄
                     if st_name and is_active == "YES":
-                        c_l1 = float(row[3]) if len(row) > 3 and row[3].strip() else None
-                        c_l2 = float(row[4]) if len(row) > 4 and row[4].strip() else None
-                        c_l3 = float(row[5]) if len(row) > 5 and row[5].strip() else None
+                        c_l1 = float(row[3]) if len(row) > 3 and row[3].strip() else None  # D 欄
+                        c_l2 = float(row[4]) if len(row) > 4 and row[4].strip() else None  # E 欄
+                        c_l3 = float(row[5]) if len(row) > 5 and row[5].strip() else None  # F 欄
                         targets[st_name] = {"l1": c_l1, "l2": c_l2, "l3": c_l3}
     except Exception as e:
-        print(f"⚠️ 讀取線上控制台失敗: {e}")
+        print(f"⚠️ 讀取線上控制台監控目標失敗: {e}")
     return targets
+
+def get_telegram_chat_ids():
+    """從 Google 試算表『控制台』讀取 H, I, J 欄授權接收通知的 Telegram Chat ID 名單"""
+    chat_ids = []
+    if not GOOGLE_SHEET_ID:
+        if TELEGRAM_CHAT_ID:
+            chat_ids.append(TELEGRAM_CHAT_ID)
+        return chat_ids
+
+    url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&sheet=控制台"
+    try:
+        res = requests.get(url, headers=HTTP_HEADERS, timeout=10)
+        if res.status_code == 200:
+            res.encoding = 'utf-8'
+            csv_reader = csv.reader(io.StringIO(res.text))
+            next(csv_reader, None)  # 略過標頭列
+            for row in csv_reader:
+                # H欄 = Index 7 (Chat ID)
+                # I欄 = Index 8 (備註/姓名)
+                # J欄 = Index 9 (啟用狀態 YES/NO)
+                if len(row) >= 10:
+                    cid = row[7].strip()
+                    is_active = row[9].strip().upper()
+                    if cid and is_active == "YES":
+                        chat_ids.append(cid)
+    except Exception as e:
+        print(f"⚠️ 讀取 Telegram 通知名單失敗: {e}")
+
+    # 如果試算表沒設定或讀取失敗，預設回退使用環境變數的 TELEGRAM_CHAT_ID
+    if not chat_ids and TELEGRAM_CHAT_ID:
+        chat_ids.append(TELEGRAM_CHAT_ID)
+
+    return list(set(chat_ids))  # 去除重複 ID
 
 def get_sheet_official_thresholds():
     """直接從 Google 試算表『官方警戒線』分頁讀取門檻資料"""
@@ -95,7 +128,7 @@ def get_sheet_official_thresholds():
         if res.status_code == 200:
             res.encoding = 'utf-8'
             csv_reader = csv.reader(io.StringIO(res.text))
-            next(csv_reader, None)
+            next(csv_reader, None)  # 略過第一列標頭
             
             for row in csv_reader:
                 if len(row) >= 4:
@@ -119,16 +152,28 @@ def get_sheet_official_thresholds():
     return thresholds
 
 def send_telegram_alert(message):
-    """發送警報至 Telegram"""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    """將警報訊息逐一推播給控制台 H/I/J 欄中開啟 YES 的所有用戶"""
+    if not TELEGRAM_BOT_TOKEN:
+        print("⚠️ 未設定 TELEGRAM_BOT_TOKEN，無法發送訊息。")
         return
+
+    target_chat_ids = get_telegram_chat_ids()
+    if not target_chat_ids:
+        print("ℹ️ 目前控制台沒有啟用 (YES) 的 Telegram 接收者。")
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "Markdown"}
-    try:
-        requests.post(url, json=payload, headers=HTTP_HEADERS, timeout=10)
-        print("🚨 警報已成功發送至 Telegram！")
-    except Exception as e:
-        print(f"❌ 發送 Telegram 訊息異常: {e}")
+
+    for cid in target_chat_ids:
+        payload = {"chat_id": cid, "text": message, "parse_mode": "Markdown"}
+        try:
+            res = requests.post(url, json=payload, headers=HTTP_HEADERS, timeout=10)
+            if res.status_code == 200:
+                print(f"🚨 警報已成功發送至 Telegram Chat ID: [{cid}]")
+            else:
+                print(f"⚠️ 發送至 [{cid}] 失敗，HTTP 狀態碼: {res.status_code}")
+        except Exception as e:
+            print(f"❌ 發送至 [{cid}] 發生異常: {e}")
 
 def get_wra_token():
     """取得水利署 API OAuth2 Bearer Token"""
@@ -163,7 +208,10 @@ def main():
         print("ℹ️ 未取得任何即時測站資料。")
         return
 
+    # 1. 同步測站字典至試算表
     sync_stations_to_sheet(stations_data)
+    
+    # 2. 讀取使用者監控目標與官方門檻
     target_config = get_user_targets()
     if not target_config:
         print("ℹ️ 目前控制台沒有開啟任何 YES 監控目標。")
@@ -172,10 +220,11 @@ def main():
     official_thresholds = get_sheet_official_thresholds()
     realtime_map = {str(item.get("Name", "")).strip(): item for item in stations_data}
     
-    # 載入歷史警報快取
+    # 3. 載入歷史警報快取記錄
     alert_cache = load_alert_cache()
     current_time = time.time()
 
+    # 4. 逐一巡檢與核對狀態
     for st_name, custom_cfg in target_config.items():
         st_data = realtime_map.get(st_name)
         if not st_data:
@@ -193,12 +242,13 @@ def main():
         if water_level is None:
             continue
 
+        # 控制台自訂 > 官方門檻
         off_cfg = official_thresholds.get(st_name, {})
         l1 = custom_cfg.get("l1") if custom_cfg.get("l1") is not None else off_cfg.get("l1")
         l2 = custom_cfg.get("l2") if custom_cfg.get("l2") is not None else off_cfg.get("l2")
         l3 = custom_cfg.get("l3") if custom_cfg.get("l3") is not None else off_cfg.get("l3")
 
-        # 計算警戒等級與數字代號 (0: 正常, 1: 三級, 2: 二級, 3: 一級)
+        # 計算警戒等級 (0: 正常, 1: 三級, 2: 二級, 3: 一級)
         alert_level, level_rank = None, 0
         if l1 is not None and water_level >= l1:
             alert_level = "🔴 一級警戒 (極高危險)"
@@ -212,7 +262,7 @@ def main():
 
         print(f"📊 [{st_name}] 水位：{water_level:.3f} m | 警戒線 (三/二/一級): {l3}/{l2}/{l1} | 狀態: {alert_level or '🟢 正常'}")
 
-        # 讀取該測站先前的歷史狀態
+        # 讀取該測站先前的歷史記錄
         st_cache = alert_cache.get(st_name, {"rank": 0, "last_notify_time": 0})
         prev_rank = st_cache.get("rank", 0)
         last_time = st_cache.get("last_notify_time", 0)
@@ -221,14 +271,14 @@ def main():
         is_recovery = False
 
         if level_rank > 0:
-            # 情況 A：剛進入警戒狀態，或警戒等級升高 (例如三級升高到一級)
+            # 情況 A：剛進入警戒，或警戒等級升高
             if level_rank > prev_rank:
                 should_notify = True
-            # 情況 B：等級相同，但已過冷卻時間 (預設 6 小時)
+            # 情況 B：警戒等級相同，但已超過冷卻時間 (6 小時)
             elif level_rank == prev_rank and (current_time - last_time) >= ALERT_COOLDOWN_SECONDS:
                 should_notify = True
         else:
-            # 情況 C：之前處於警戒狀態，現在水位回落至正常 -> 發送解除警戒通知
+            # 情況 C：由警戒狀態回落至正常水位 -> 發送解除警戒通知
             if prev_rank > 0:
                 should_notify = True
                 is_recovery = True
@@ -256,19 +306,19 @@ def main():
                 )
             
             send_telegram_alert(msg)
-            # 更新快取
+            # 更新狀態與發送時間
             alert_cache[st_name] = {
                 "rank": level_rank,
                 "last_notify_time": current_time
             }
         else:
-            # 未觸發通知時，更新等級（維持 rank）
+            # 未觸發通知時，保持原狀態
             alert_cache[st_name] = {
                 "rank": level_rank,
                 "last_notify_time": last_time
             }
 
-    # 寫入最新狀態至 JSON 快取檔
+    # 5. 寫入快取檔案
     save_alert_cache(alert_cache)
 
 if __name__ == "__main__":
