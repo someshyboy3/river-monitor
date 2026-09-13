@@ -2,13 +2,14 @@ import os
 import csv
 import io
 import json
+import time
 import requests
 import urllib3
 
-# 關閉不安全 HTTP 請求的警告訊息
+# 關閉不安全 HTTP 請求警告
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# 從環境變數讀取金鑰與設定
+# 環境變數與金鑰
 CLIENT_ID = os.environ.get("CLIENT_ID", "").strip()
 CLIENT_SECRET = os.environ.get("CLIENT_SECRET", "").strip()
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -18,11 +19,33 @@ GOOGLE_WEBAPP_URL = os.environ.get("GOOGLE_WEBAPP_URL", "").strip()
 
 IOT_TOKEN_URL = "https://iot.wra.gov.tw/Oauth2/token"
 IOT_STATIONS_URL = "https://iot.wra.gov.tw/river/stations"
+CACHE_FILE = "alert_cache.json"
+
+# 同一等級警報重複推播的冷卻時間（單位：秒，預設 6 小時）
+ALERT_COOLDOWN_SECONDS = 6 * 3600
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     "Accept": "application/json"
 }
+
+def load_alert_cache():
+    """載入歷史警報快取記錄"""
+    if os.path.exists(CACHE_FILE):
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_alert_cache(cache_data):
+    """儲存警報快取記錄"""
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"⚠️ 寫入警報快取失敗: {e}")
 
 def sync_stations_to_sheet(stations_data):
     """將 API 抓到的測站字典同步至 Google 試算表"""
@@ -46,7 +69,7 @@ def get_user_targets():
         if res.status_code == 200:
             res.encoding = 'utf-8'
             csv_reader = csv.reader(io.StringIO(res.text))
-            next(csv_reader, None)  # 略過標頭列
+            next(csv_reader, None)  # 略過標頭
             for row in csv_reader:
                 if len(row) >= 3:
                     st_name = row[1].strip()
@@ -64,7 +87,6 @@ def get_sheet_official_thresholds():
     """直接從 Google 試算表『官方警戒線』分頁讀取門檻資料"""
     thresholds = {}
     if not GOOGLE_SHEET_ID:
-        print("⚠️ 未設定 GOOGLE_SHEET_ID，無法讀取官方警戒線。")
         return thresholds
 
     url = f"https://docs.google.com/spreadsheets/d/{GOOGLE_SHEET_ID}/gviz/tq?tqx=out:csv&sheet=官方警戒線"
@@ -73,7 +95,7 @@ def get_sheet_official_thresholds():
         if res.status_code == 200:
             res.encoding = 'utf-8'
             csv_reader = csv.reader(io.StringIO(res.text))
-            next(csv_reader, None)  # 略過第一列標頭
+            next(csv_reader, None)
             
             for row in csv_reader:
                 if len(row) >= 4:
@@ -87,16 +109,11 @@ def get_sheet_official_thresholds():
                         except ValueError:
                             return None
 
-                    # 欄位對應：StationName, WarningLevel3, WarningLevel2, WarningLevel1
                     l3 = parse_float(row[1])
                     l2 = parse_float(row[2])
                     l1 = parse_float(row[3])
-                    
                     thresholds[st_name] = {"l1": l1, "l2": l2, "l3": l3}
-                    
             print(f"🌐 成功從試算表讀取 {len(thresholds)} 個官方警戒線資料。")
-        else:
-            print(f"⚠️ 讀取『官方警戒線』分頁失敗，HTTP 狀態碼: {res.status_code}")
     except Exception as e:
         print(f"⚠️ 讀取試算表官方警戒線異常: {e}")
     return thresholds
@@ -146,24 +163,22 @@ def main():
         print("ℹ️ 未取得任何即時測站資料。")
         return
 
-    # 1. 同步全台 1600+ 測站資料庫至試算表字典
     sync_stations_to_sheet(stations_data)
-
-    # 2. 讀取使用者要在控制台監控的測站清單
     target_config = get_user_targets()
     if not target_config:
         print("ℹ️ 目前控制台沒有開啟任何 YES 監控目標。")
         return
 
-    # 3. 讀取試算表中由 GAS 抓好的『官方警戒線』門檻
     official_thresholds = get_sheet_official_thresholds()
     realtime_map = {str(item.get("Name", "")).strip(): item for item in stations_data}
+    
+    # 載入歷史警報快取
+    alert_cache = load_alert_cache()
+    current_time = time.time()
 
-    # 4. 逐一比對水位與發送通知
     for st_name, custom_cfg in target_config.items():
         st_data = realtime_map.get(st_name)
         if not st_data:
-            print(f"❓ 找不到對應測站 [{st_name}]")
             continue
 
         water_level, record_time = None, "未知"
@@ -178,35 +193,83 @@ def main():
         if water_level is None:
             continue
 
-        # 優先權：控制台自訂數值 > 官方警戒線分頁數值
         off_cfg = official_thresholds.get(st_name, {})
         l1 = custom_cfg.get("l1") if custom_cfg.get("l1") is not None else off_cfg.get("l1")
         l2 = custom_cfg.get("l2") if custom_cfg.get("l2") is not None else off_cfg.get("l2")
         l3 = custom_cfg.get("l3") if custom_cfg.get("l3") is not None else off_cfg.get("l3")
 
-        alert_level = None
+        # 計算警戒等級與數字代號 (0: 正常, 1: 三級, 2: 二級, 3: 一級)
+        alert_level, level_rank = None, 0
         if l1 is not None and water_level >= l1:
             alert_level = "🔴 一級警戒 (極高危險)"
+            level_rank = 3
         elif l2 is not None and water_level >= l2:
             alert_level = "🟠 二級警戒 (高危險)"
+            level_rank = 2
         elif l3 is not None and water_level >= l3:
             alert_level = "🟡 三級警戒 (注意)"
+            level_rank = 1
 
         print(f"📊 [{st_name}] 水位：{water_level:.3f} m | 警戒線 (三/二/一級): {l3}/{l2}/{l1} | 狀態: {alert_level or '🟢 正常'}")
 
-        if alert_level:
-            msg = (
-                f"🚨 *【水位警戒通知】*\n\n"
-                f"📍 *測站名稱*：{st_name}\n"
-                f"⚠️ *警戒狀態*：{alert_level}\n"
-                f"🌊 *當前水位*：`{water_level:.3f}` m\n"
-                f"📏 *警戒門檻*：\n"
-                f"  • 三級：{l3 or '未設定'} m\n"
-                f"  • 二級：{l2 or '未設定'} m\n"
-                f"  • 一級：{l1 or '未設定'} m\n"
-                f"🕒 *更新時間*：{record_time}"
-            )
+        # 讀取該測站先前的歷史狀態
+        st_cache = alert_cache.get(st_name, {"rank": 0, "last_notify_time": 0})
+        prev_rank = st_cache.get("rank", 0)
+        last_time = st_cache.get("last_notify_time", 0)
+
+        should_notify = False
+        is_recovery = False
+
+        if level_rank > 0:
+            # 情況 A：剛進入警戒狀態，或警戒等級升高 (例如三級升高到一級)
+            if level_rank > prev_rank:
+                should_notify = True
+            # 情況 B：等級相同，但已過冷卻時間 (預設 6 小時)
+            elif level_rank == prev_rank and (current_time - last_time) >= ALERT_COOLDOWN_SECONDS:
+                should_notify = True
+        else:
+            # 情況 C：之前處於警戒狀態，現在水位回落至正常 -> 發送解除警戒通知
+            if prev_rank > 0:
+                should_notify = True
+                is_recovery = True
+
+        if should_notify:
+            if is_recovery:
+                msg = (
+                    f"🟢 *【水位警戒解除通知】*\n\n"
+                    f"📍 *測站名稱*：{st_name}\n"
+                    f"✅ *當前狀態*：水位已降至警戒線以下\n"
+                    f"🌊 *當前水位*：`{water_level:.3f}` m\n"
+                    f"🕒 *更新時間*：{record_time}"
+                )
+            else:
+                msg = (
+                    f"🚨 *【水位警戒通知】*\n\n"
+                    f"📍 *測站名稱*：{st_name}\n"
+                    f"⚠️ *警戒狀態*：{alert_level}\n"
+                    f"🌊 *當前水位*：`{water_level:.3f}` m\n"
+                    f"📏 *警戒門檻*：\n"
+                    f"  • 三級：{l3 or '未設定'} m\n"
+                    f"  • 二級：{l2 or '未設定'} m\n"
+                    f"  • 一級：{l1 or '未設定'} m\n"
+                    f"🕒 *更新時間*：{record_time}"
+                )
+            
             send_telegram_alert(msg)
+            # 更新快取
+            alert_cache[st_name] = {
+                "rank": level_rank,
+                "last_notify_time": current_time
+            }
+        else:
+            # 未觸發通知時，更新等級（維持 rank）
+            alert_cache[st_name] = {
+                "rank": level_rank,
+                "last_notify_time": last_time
+            }
+
+    # 寫入最新狀態至 JSON 快取檔
+    save_alert_cache(alert_cache)
 
 if __name__ == "__main__":
     main()
