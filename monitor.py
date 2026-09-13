@@ -19,7 +19,6 @@ IOT_STATIONS_URL = "https://iot.wra.gov.tw/river/stations"
 WARNING_LEVELS_URL = "https://opendata.wra.gov.tw/api/v2/39ad439a-f7aa-4fd4-b1a7-e4622852cc69?sort=_importdate%20asc&format=JSON"
 
 def sync_stations_to_sheet(stations_data):
-    """自動將 API 全台測站清單寫入 Google Sheet 字典"""
     if not GOOGLE_WEBAPP_URL:
         return
     dict_list = [[str(st.get("Name", "")).strip(), str(st.get("BasinName", "未知")).strip()] for st in stations_data if st.get("Name")]
@@ -31,10 +30,6 @@ def sync_stations_to_sheet(stations_data):
         print(f"⚠️ 同步測站字典失敗: {e}")
 
 def get_user_targets():
-    """
-    從 Google Sheet 讀取監控目標
-    結構：A欄(流域)、B欄(測站名稱)、C欄(是否監控 YES)、D~F欄(自訂一/二/三級門檻)
-    """
     targets = {}
     if not GOOGLE_SHEET_ID:
         return targets
@@ -44,7 +39,7 @@ def get_user_targets():
         if res.status_code == 200:
             res.encoding = 'utf-8'
             csv_reader = csv.reader(io.StringIO(res.text))
-            next(csv_reader, None)  # 跳過標題列
+            next(csv_reader, None)
             for row in csv_reader:
                 if len(row) >= 3:
                     st_name = row[1].strip()
@@ -59,35 +54,50 @@ def get_user_targets():
     return targets
 
 def get_official_thresholds():
-    """從水利署 OpenData 取得官方一/二/三級警戒水位門檻"""
+    """全相容剖析水利署 OpenData 警戒門檻 API"""
     thresholds = {}
     try:
         res = requests.get(WARNING_LEVELS_URL, timeout=15, verify=False)
         if res.status_code == 200:
             data = res.json()
-            records = data if isinstance(data, list) else data.get("responseData", data.get("data", []))
             
+            # 自動適應 JSON 根節點或層級嵌套
+            records = []
+            if isinstance(data, list):
+                records = data
+            elif isinstance(data, dict):
+                records = data.get("responseData") or data.get("data") or data.get("records") or []
+
+            def parse_val(v):
+                if v is None: return None
+                s = str(v).strip()
+                if not s or s == "null" or s == "-999": return None
+                try:
+                    return float(s)
+                except ValueError:
+                    return None
+
             for item in records:
-                name = str(item.get("StationName") or item.get("propertyName") or "").strip()
-                if name:
-                    def parse_val(v):
-                        try:
-                            return float(v) if v is not None and str(v).strip() != "" else None
-                        except ValueError:
-                            return None
+                if not isinstance(item, dict): continue
+                
+                # 自動搜尋可能的測站名稱欄位
+                name = item.get("StationName") or item.get("propertyName") or item.get("stationName") or item.get("Name")
+                if not name: continue
+                name = str(name).strip()
 
-                    l1 = parse_val(item.get("WarningLevel1") or item.get("Level1"))
-                    l2 = parse_val(item.get("WarningLevel2") or item.get("Level2"))
-                    l3 = parse_val(item.get("WarningLevel3") or item.get("Level3"))
+                # 自動搜尋一/二/三級門檻欄位名稱
+                l1 = parse_val(item.get("WarningLevel1") or item.get("Level1") or item.get("warningLevel1"))
+                l2 = parse_val(item.get("WarningLevel2") or item.get("Level2") or item.get("warningLevel2"))
+                l3 = parse_val(item.get("WarningLevel3") or item.get("Level3") or item.get("warningLevel3"))
 
-                    thresholds[name] = {"l1": l1, "l2": l2, "l3": l3}
+                thresholds[name] = {"l1": l1, "l2": l2, "l3": l3}
+            
             print(f"🌐 成功解析官方 {len(thresholds)} 個測站警戒門檻資料。")
     except Exception as e:
         print(f"⚠️ 讀取官方警戒門檻 API 失敗: {e}")
     return thresholds
 
 def send_telegram_alert(message):
-    """發送 Telegram 推播"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ 未設定 Telegram 金鑰，跳過推播。")
         return
@@ -103,7 +113,6 @@ def send_telegram_alert(message):
         print(f"❌ 發送 Telegram 訊息異常: {e}")
 
 def get_wra_token():
-    """取得水利署 API Token"""
     try:
         payload = {"grant_type": "client_credentials", "client_id": CLIENT_ID, "client_secret": CLIENT_SECRET}
         res = requests.post(IOT_TOKEN_URL, data=payload, timeout=15, verify=False)
@@ -121,7 +130,6 @@ def main():
         print("❌ 無法取得水利署 API Token")
         return
 
-    # 1. 抓取 API 即時資料
     headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
     try:
         res = requests.get(IOT_STATIONS_URL, headers=headers, timeout=20, verify=False)
@@ -134,10 +142,8 @@ def main():
         print("ℹ️ 未取得任何即時測站資料。")
         return
 
-    # 2. 自動同步全台測站至 Google Sheet 字典
     sync_stations_to_sheet(stations_data)
 
-    # 3. 讀取監控目標與官方警報門檻
     target_config = get_user_targets()
     if not target_config:
         print("ℹ️ 目前沒有開啟任何監控目標。")
@@ -146,7 +152,6 @@ def main():
     official_thresholds = get_official_thresholds()
     realtime_map = {str(item.get("Name", "")).strip(): item for item in stations_data}
 
-    # 4. 進行水位與門檻比對
     for st_name, custom_cfg in target_config.items():
         st_data = realtime_map.get(st_name)
         if not st_data:
@@ -165,13 +170,11 @@ def main():
         if water_level is None:
             continue
 
-        # 優先取用自訂門檻，若無自訂則採用官方門檻
         off_cfg = official_thresholds.get(st_name, {})
         l1 = custom_cfg.get("l1") or off_cfg.get("l1")
         l2 = custom_cfg.get("l2") or off_cfg.get("l2")
         l3 = custom_cfg.get("l3") or off_cfg.get("l3")
 
-        # 警戒等級判定
         alert_level = None
         if l1 and water_level >= l1:
             alert_level = "🔴 一級警戒 (極高危險)"
@@ -182,7 +185,6 @@ def main():
 
         print(f"📊 [{st_name}] 水位：{water_level:.3f} m | 門檻 (三/二/一級): {l3}/{l2}/{l1} | 狀態: {alert_level or '🟢 正常'}")
 
-        # 觸發 Telegram 警報
         if alert_level:
             msg = (
                 f"🚨 *【水位警戒通知】*\n\n"
