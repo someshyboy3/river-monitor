@@ -16,14 +16,10 @@ GOOGLE_WEBAPP_URL = os.environ.get("GOOGLE_WEBAPP_URL", "").strip()
 
 IOT_TOKEN_URL = "https://iot.wra.gov.tw/Oauth2/token"
 IOT_STATIONS_URL = "https://iot.wra.gov.tw/river/stations"
-WARNING_LEVELS_URL = "https://opendata.wra.gov.tw/api/v2/39ad439a-f7aa-4fd4-b1a7-e4622852cc69?sort=_importdate%20asc&format=JSON"
 
-# 建立預設 Header，模擬台灣 Chrome 瀏覽器請求[cite: 1, 2]
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://opendata.wra.gov.tw/"
+    "Accept": "application/json, text/plain, */*"
 }
 
 def sync_stations_to_sheet(stations_data):
@@ -61,40 +57,30 @@ def get_user_targets():
         print(f"⚠️ 讀取線上控制台失敗: {e}")
     return targets
 
-def parse_val(v):
-    if v is None: return None
-    s = str(v).strip()
-    if not s or s == "null" or s == "-999": return None
-    try:
-        return float(s)
-    except ValueError:
-        return None
-
-def get_official_thresholds():
-    """試圖從水利署 OpenData API 獲取官方門檻"""
+def extract_thresholds_from_iot(stations_data):
+    """直接剖析已授權的 IoT API 資料包，無懼海外 IP 封鎖"""
     thresholds = {}
-    try:
-        res = requests.get(WARNING_LEVELS_URL, headers=HTTP_HEADERS, timeout=15, verify=False)
-        if res.status_code == 200:
-            data = res.json()
-            records = data if isinstance(data, list) else data.get("responseData", data.get("data", []))
+    for st in stations_data:
+        name = str(st.get("Name", "")).strip()
+        if not name:
+            continue
+        
+        l1, l2, l3 = None, None, None
+        
+        for attr in st.get("Attributes", []):
+            attr_name = str(attr.get("Name", "")).lower()
+            val = attr.get("Value")
+            try:
+                num_val = float(val) if val is not None and float(val) > -900 else None
+                if "一級" in attr_name or "level1" in attr_name: l1 = num_val
+                elif "二級" in attr_name or "level2" in attr_name: l2 = num_val
+                elif "三級" in attr_name or "level3" in attr_name: l3 = num_val
+            except (ValueError, TypeError):
+                pass
+
+        if l1 or l2 or l3:
+            thresholds[name] = {"l1": l1, "l2": l2, "l3": l3}
             
-            for item in records:
-                if not isinstance(item, dict): continue
-                name = item.get("StationName") or item.get("propertyName") or item.get("stationName")
-                if not name: continue
-                name = str(name).strip()
-
-                l1 = parse_val(item.get("WarningLevel1") or item.get("Level1"))
-                l2 = parse_val(item.get("WarningLevel2") or item.get("Level2"))
-                l3 = parse_val(item.get("WarningLevel3") or item.get("Level3"))
-
-                thresholds[name] = {"l1": l1, "l2": l2, "l3": l3}
-            print(f"🌐 成功解析官方 {len(thresholds)} 個測站警戒門檻資料。")
-        else:
-            print(f"⚠️ 門檻 API 回傳 HTTP 狀態碼：{res.status_code}")
-    except Exception as e:
-        print(f"⚠️ 讀取官方警戒門檻 API 異常: {e}")
     return thresholds
 
 def send_telegram_alert(message):
@@ -151,7 +137,10 @@ def main():
         print("ℹ️ 目前沒有開啟任何監控目標。")
         return
 
-    official_thresholds = get_official_thresholds()
+    # 直接從 IoT 授權資料內提取官方門檻
+    official_thresholds = extract_thresholds_from_iot(stations_data)
+    print(f"🌐 成功從 IoT 授權 API 提取 {len(official_thresholds)} 個測站的官方警戒門檻。")
+
     realtime_map = {str(item.get("Name", "")).strip(): item for item in stations_data}
 
     for st_name, custom_cfg in target_config.items():
