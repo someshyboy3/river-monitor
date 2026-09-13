@@ -2,15 +2,15 @@ name: 24hr River Level Monitor
 
 on:
   schedule:
-    # 每 5 分鐘自動巡檢一次
-    - cron: '*/5 * * * *'
+    # 改為每 10 分鐘執行一次 (大幅提高 GitHub 排程配給的準點率)
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # 明確授予 GitHub Action 修改與提交檔案的權限
+      contents: write # 授予寫入與 Push 權限
 
     steps:
       - name: 檢出專案程式碼
@@ -40,6 +40,10 @@ jobs:
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
-          git add alert_cache.json
-          git diff-index --quiet HEAD || git commit -m "chore: update alert cache"
-          git push
+          if [ -f alert_cache.json ]; then
+            git add alert_cache.json
+            # [skip ci] 可防止 push 後再次誤觸發工作流程
+            git diff-index --quiet HEAD || git commit -m "chore: update alert cache [skip ci]"
+            git pull --rebase origin main || true
+            git push
+          fi
