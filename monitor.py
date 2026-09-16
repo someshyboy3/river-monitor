@@ -21,7 +21,7 @@ IOT_TOKEN_URL = "https://iot.wra.gov.tw/Oauth2/token"
 IOT_STATIONS_URL = "https://iot.wra.gov.tw/river/stations"
 CACHE_FILE = "alert_cache.json"
 
-# 設定急速上升的斜率門檻：例如每分鐘上升超過 0.05 公尺 (即 5 公分/分鐘，可依需求調整)
+# 設定急速上升的斜率門檻：例如每分鐘上升超過 0.05 公尺 (即 5 公分/分鐘)
 RAPID_RISE_THRESHOLD_PER_MIN = 0.05 
 
 HTTP_HEADERS = {
@@ -84,7 +84,7 @@ def get_user_targets():
     return targets
 
 def get_telegram_chat_ids():
-    """從 Google 試算表『控制台』讀取 H, I, J 欄授權接收通知的 Telegram Chat ID 名單"""
+    """從 Google 試算表『控制台』讀取授權接收通知的 Telegram Chat ID 名單"""
     chat_ids = []
     if not GOOGLE_SHEET_ID:
         if TELEGRAM_CHAT_ID:
@@ -170,7 +170,7 @@ def get_wra_token():
     return None
 
 def main():
-    print("🚀 開始執行河川水位巡檢與警報核對（含動態最低警戒線與斜率偵測）...")
+    print("🚀 開始執行河川水位巡檢與警報核對（含智慧 NB 警戒對照與門檻顯示）...")
     
     token = get_wra_token()
     if not token:
@@ -218,12 +218,17 @@ def main():
         if water_level is None:
             continue
 
-        off_cfg = official_thresholds.get(st_name, {})
+        # NB 站點自動容錯回溯對照機制
+        off_cfg = official_thresholds.get(st_name)
+        if not off_cfg:
+            clean_name = st_name.replace("-NB", "").replace("_NB", "").replace("NB", "").strip()
+            off_cfg = official_thresholds.get(clean_name, {})
+
         l1 = custom_cfg.get("l1") if custom_cfg.get("l1") is not None else off_cfg.get("l1")
         l2 = custom_cfg.get("l2") if custom_cfg.get("l2") is not None else off_cfg.get("l2")
         l3 = custom_cfg.get("l3") if custom_cfg.get("l3") is not None else off_cfg.get("l3")
 
-        # 計算當前警戒等級 (0: 正常, 1: 三級, 2: 二級, 3: 一級)
+        # 計算當前警戒等級
         alert_level, level_rank = None, 0
         if l1 is not None and water_level >= l1:
             alert_level = "🔴 一級警戒 (極高危險)"
@@ -235,40 +240,40 @@ def main():
             alert_level = "🟡 三級警戒 (注意)"
             level_rank = 1
 
-        # 讀取該測站上次快取記錄
+        # 讀取快取記錄
         st_cache = alert_cache.get(st_name, {})
         prev_rank = st_cache.get("rank", 0)
         prev_level = st_cache.get("level", water_level)
         prev_time = st_cache.get("time", current_time)
 
-        # 🟢 計算水位斜率 (變化速率：公尺 / 分鐘)
+        # 計算水位斜率
         time_diff_mins = (current_time - prev_time) / 60.0
         is_rapid_rising = False
         slope_val = 0.0
 
         if time_diff_mins > 0:
             slope_val = (water_level - prev_level) / time_diff_mins
-
-            # 1️⃣ 動態尋找現有可用的「最低警戒線」（優先順序：三級 l3 -> 二級 l2 -> 一級 l1）
             lowest_threshold = l3 if l3 is not None else (l2 if l2 is not None else l1)
 
-            # 2️⃣ 智慧接近觸發機制：當前已達警戒，或水位已經接近最低警戒線（例如距離 0.5 公尺以內）
             is_close_to_warning = False
             if lowest_threshold is not None:
                 if water_level >= (lowest_threshold - 0.5):
                     is_close_to_warning = True
 
-            # 3️⃣ 觸發急速上升條件：斜率超過門檻，且 (已經達到警戒 或 接近最低警戒線)
             if slope_val >= RAPID_RISE_THRESHOLD_PER_MIN and (level_rank >= 1 or is_close_to_warning):
                 is_rapid_rising = True
 
-        print(f"📊 [{st_name}] 水位：{water_level:.3f} m | 狀態: {alert_level or '🟢 正常'} | 升幅率: {slope_val:.4f} m/min")
+        # 格式化門檻數值顯示 (無值則顯示 None)
+        l3_str = f"{l3:.2f}m" if l3 is not None else "None"
+        l2_str = f"{l2:.2f}m" if l2 is not None else "None"
+        l1_str = f"{l1:.2f}m" if l1 is not None else "None"
+
+        print(f"📊 [{st_name}] 水位：{water_level:.3f} m | 狀態: {alert_level or '🟢 正常'} | 升幅率: {slope_val:.4f} m/min | 門檻(三/二/一級): [{l3_str} / {l2_str} / {l1_str}]")
 
         should_notify = False
         is_recovery = False
         notify_msg = ""
 
-        # 判斷是否需要發送通知
         if level_rank != prev_rank:
             if level_rank == 0:
                 should_notify = True
@@ -287,7 +292,6 @@ def main():
                     f"🕒 *更新時間*：{record_time}"
                 )
         elif is_rapid_rising:
-            # 雖然等級沒變，但偵測到在警戒區間或接近警戒區間內「急速上升」！
             should_notify = True
             notify_msg = (
                 f"⚠️ *【水位急速飆升警告】*\n\n"
@@ -310,7 +314,6 @@ def main():
             
             send_telegram_alert(notify_msg)
 
-        # 更新該測站的快取資料（包含當前水位與時間，供下次計算斜率使用）
         alert_cache[st_name] = {
             "rank": level_rank,
             "level": water_level,
