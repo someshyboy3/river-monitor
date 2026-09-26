@@ -29,6 +29,17 @@ HTTP_HEADERS = {
     "Accept": "application/json"
 }
 
+def format_time_str(ts_str):
+    """將 ISO 時間格式 (2026-09-27T00:30:00+08:00) 轉換為標準乾淨格式 (2026-09-27 00:30:00)"""
+    if not ts_str or ts_str == "未知":
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+    try:
+        # 移除 +08:00 時區與毫秒，並將 T 替換為空格
+        clean_ts = ts_str.split("+")[0].split(".")[0].replace("T", " ")
+        return clean_ts.strip()
+    except Exception:
+        return ts_str
+
 def load_alert_cache():
     """載入歷史快取記錄"""
     if os.path.exists(CACHE_FILE):
@@ -226,17 +237,20 @@ def main():
         if not st_data:
             continue
 
-        water_level, record_time = None, "未知"
+        water_level, raw_record_time = None, "未知"
         for m in st_data.get("Measurements", []):
             if "水位" in str(m.get("Name", "")) or "water" in str(m.get("FullName", "")).lower():
                 val = m.get("Value")
                 if val is not None and float(val) > -900:
                     water_level = float(val)
-                    record_time = m.get("TimeStamp", "未知")
+                    raw_record_time = m.get("TimeStamp", "未知")
                     break
 
         if water_level is None:
             continue
+
+        # 統一將時間轉為易讀的標準格式 (2026-09-27 00:30:00)
+        formatted_record_time = format_time_str(raw_record_time)
 
         # NB 站點自動容錯回溯對照機制
         off_cfg = official_thresholds.get(st_name)
@@ -309,7 +323,7 @@ def main():
                     f"  • 三級：{l3 or '未設定'} m\n"
                     f"  • 二級：{l2 or '未設定'} m\n"
                     f"  • 一級：{l1 or '未設定'} m\n"
-                    f"🕒 *更新時間*：{record_time}"
+                    f"🕒 *更新時間*：{formatted_record_time}"
                 )
         elif is_rapid_rising:
             should_notify = True
@@ -319,7 +333,7 @@ def main():
                 f"📈 *警告類型*：水位異常急遽上升！\n"
                 f"🌊 *當前水位*：`{water_level:.3f}` m\n"
                 f"⚡ *上升速率*：`{slope_val:.3f}` 公尺/分鐘\n"
-                f"🕒 *更新時間*：{record_time}"
+                f"🕒 *更新時間*：{formatted_record_time}"
             )
 
         if should_notify:
@@ -329,7 +343,7 @@ def main():
                     f"📍 *測站名稱*：{st_name}\n"
                     f"✅ *當前狀態*：水位已降至警戒線以下\n"
                     f"🌊 *當前水位*：`{water_level:.3f}` m\n"
-                    f"🕒 *更新時間*：{record_time}"
+                    f"🕒 *更新時間*：{formatted_record_time}"
                 )
             
             send_telegram_alert(notify_msg)
@@ -344,7 +358,7 @@ def main():
         # 欄位順序：記錄時間、測站名稱、當前水位(m)、狀態、升降速率(m/min)、三級門檻、二級門檻、一級門檻
         current_status = alert_level if alert_level else "🟢 正常"
         batch_records_to_sheet.append([
-            record_time,
+            formatted_record_time,
             st_name,
             round(water_level, 3),
             current_status,
