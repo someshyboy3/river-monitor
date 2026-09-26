@@ -48,15 +48,32 @@ def save_alert_cache(cache_data):
         print(f"⚠️ 寫入警報快取失敗: {e}")
 
 def sync_stations_to_sheet(stations_data):
-    """將 API 抓到的全台測站字典同步至 Google 試算表"""
+    """將 API 抓到的全台測站字典同步至 Google 試算表 (A欄流域、B欄測站名稱)"""
     if not GOOGLE_WEBAPP_URL:
         return
-    dict_list = [[str(st.get("Name", "")).strip(), str(st.get("BasinName", "未知")).strip()] for st in stations_data if st.get("Name")]
+    dict_list = [[str(st.get("BasinName", "未知")).strip(), str(st.get("Name", "")).strip()] for st in stations_data if st.get("Name")]
     try:
         requests.post(GOOGLE_WEBAPP_URL, json=dict_list, headers=HTTP_HEADERS, timeout=15)
         print(f"🔄 已成功同步 {len(dict_list)} 個測站至試算表字典。")
     except Exception as e:
         print(f"⚠️ 同步測站字典失敗: {e}")
+
+def sync_records_to_sheet(record_rows):
+    """將本次巡檢的所有測站即時數值批次寫入『水位記錄』工作表"""
+    if not GOOGLE_WEBAPP_URL or not record_rows:
+        return
+    payload = {
+        "action": "record_levels",
+        "rows": record_rows
+    }
+    try:
+        res = requests.post(GOOGLE_WEBAPP_URL, json=payload, headers=HTTP_HEADERS, timeout=15)
+        if res.status_code == 200:
+            print(f"📝 已成功將 {len(record_rows)} 筆水位檢測紀錄寫入試算表！")
+        else:
+            print(f"⚠️ 寫入水位紀錄失敗，HTTP 狀態碼: {res.status_code}")
+    except Exception as e:
+        print(f"⚠️ 寫入水位紀錄連線異常: {e}")
 
 def get_user_targets():
     """從 Google 試算表『控制台』分頁讀取使用者自訂監控目標與門檻"""
@@ -201,6 +218,9 @@ def main():
     alert_cache = load_alert_cache()
     current_time = time.time()
 
+    # 建立用來寫入「水位記錄」清單
+    batch_records_to_sheet = []
+
     for st_name, custom_cfg in target_config.items():
         st_data = realtime_map.get(st_name)
         if not st_data:
@@ -319,6 +339,24 @@ def main():
             "level": water_level,
             "time": current_time
         }
+
+        # 整理此測站的數據，準備寫入試算表
+        # 欄位順序：記錄時間、測站名稱、當前水位(m)、狀態、升降速率(m/min)、三級門檻、二級門檻、一級門檻
+        current_status = alert_level if alert_level else "🟢 正常"
+        batch_records_to_sheet.append([
+            record_time,
+            st_name,
+            round(water_level, 3),
+            current_status,
+            round(slope_val, 4),
+            l3 if l3 is not None else "",
+            l2 if l2 is not None else "",
+            l1 if l1 is not None else ""
+        ])
+
+    # 巡檢完畢後，整批寫入 Google 試算表（只發送一次請求，極為快速穩定）
+    if batch_records_to_sheet:
+        sync_records_to_sheet(batch_records_to_sheet)
 
     save_alert_cache(alert_cache)
 
